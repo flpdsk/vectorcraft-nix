@@ -1,0 +1,82 @@
+name: Build VectorCraft cache
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - flake.nix
+      - flake.lock
+      - package.nix
+      - .github/workflows/build-cache.yml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: vectorcraft-cache-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: cachix/install-nix-action@v31
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: cachix/cachix-action@v17
+        with:
+          name: flpdsk-vectorcraft
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          useDaemon: false
+
+      - name: Update the upstream source pin
+        run: nix flake update vectorcraft-src
+
+      - name: Build VectorCraft and refresh Cargo vendor hash if needed
+        shell: bash
+        run: |
+          if ! nix build .#vectorcraft --no-link --print-out-paths >result-paths.txt 2>build.log; then
+            cat build.log
+            if ! grep -q 'hash mismatch in fixed-output derivation' build.log; then
+              echo "Build failed for a reason other than the Cargo vendor hash." >&2
+              exit 1
+            fi
+            cargo_hash="$(sed -n 's/.*got: *//p' build.log | head -n 1)"
+            if [[ "$cargo_hash" != sha256-* ]]; then
+              echo "Build failed without a Cargo vendor hash to update." >&2
+              exit 1
+            fi
+            sed -i -E "s|cargoHash = \".*\";|cargoHash = \"$cargo_hash\";|" package.nix
+            git diff --check
+            nix build .#vectorcraft --no-link --print-out-paths >result-paths.txt
+          fi
+
+      - name: Push the package closure to Cachix
+        run: cachix push flpdsk-vectorcraft < result-paths.txt
+
+      - name: Report package and runtime closure sizes
+        run: |
+          {
+            echo '### VectorCraft Nix sizes'
+            echo 'The first row is the package output; the second is its runtime closure (NAR sizes).'
+            echo '```text'
+            nix path-info --size --human-readable .#vectorcraft
+            nix path-info --closure-size --human-readable .#vectorcraft
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Promote the source pin after a successful build
+        run: |
+          if git diff --quiet -- flake.lock package.nix; then
+            echo "The source pin and Cargo hash are already current."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add flake.lock package.nix
+          git commit -m "chore: update VectorCraft source pin"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
